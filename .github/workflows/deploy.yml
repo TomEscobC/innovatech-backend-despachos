@@ -1,0 +1,109 @@
+# ─────────────────────────────────────────────────────────────────
+# .github/workflows/deploy.yml
+# Pipeline CI/CD — Backend Despachos
+# Trigger: push en la rama "deploy"
+# Flujo: Build → Push a Docker Hub → Deploy en EC2
+# ─────────────────────────────────────────────────────────────────
+
+name: CI/CD Backend Despachos
+
+on:
+  push:
+    branches:
+      - deploy       # Solo se activa con push a la rama "deploy"
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/backend-despachos
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # JOB 1: Build & Push — construye la imagen y la sube a Docker Hub
+  # ──────────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build y Push Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout del código fuente
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      # 2. Configurar Java 17 para el build de Maven (opcional si el Dockerfile es autosuficiente)
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+
+      # 3. Login en Docker Hub usando secrets de GitHub
+      - name: Login en Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 4. Configurar Docker Buildx (soporte multi-plataforma y caché)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 5. Build y push de la imagen con multi-tag (SHA + latest)
+      - name: Build y Push imagen Docker
+        uses: docker/build-push-action@v5
+        with:
+          context: ./Springboot-API-REST-DESPACHO
+          file: ./Springboot-API-REST-DESPACHO/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 2: Deploy — conecta a EC2 y actualiza el contenedor
+  # ──────────────────────────────────────────────────────────────
+  deploy-to-ec2:
+    name: Deploy en EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push   # Solo corre si el build fue exitoso
+
+    steps:
+      # 6. Despliegue vía SSH a la instancia EC2 del Backend
+      - name: Deploy en EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_BACKEND_HOST }}       # IP pública o DNS de la instancia EC2
+          username: ${{ secrets.EC2_USERNAME }}        # Usuario SSH (ej: ec2-user, ubuntu)
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}      # Clave privada .pem del EC2
+          port: 22
+          script: |
+            # Hacer login en Docker Hub desde EC2
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+            # Descargar la nueva imagen
+            docker pull ${{ env.IMAGE_NAME }}:latest
+
+            # Detener y eliminar el contenedor anterior (si existe)
+            docker stop backend-despachos 2>/dev/null || true
+            docker rm backend-despachos 2>/dev/null || true
+
+            # Levantar el nuevo contenedor con variables de entorno desde EC2 Secrets
+            docker run -d \
+              --name backend-despachos \
+              --restart unless-stopped \
+              -p 8081:8081 \
+              -e DB_ENDPOINT="${{ secrets.DB_ENDPOINT }}" \
+              -e DB_PORT="${{ secrets.DB_PORT }}" \
+              -e DB_NAME="${{ secrets.DB_NAME }}" \
+              -e DB_USERNAME="${{ secrets.DB_USERNAME }}" \
+              -e DB_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+              ${{ env.IMAGE_NAME }}:latest
+
+            # Verificar que el contenedor quedó corriendo
+            sleep 10
+            docker ps | grep backend-despachos
+
+            # Limpiar imágenes antiguas para liberar espacio en disco
+            docker image prune -f

@@ -1,0 +1,78 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────
+# docker-compose.yml — Backend Despachos + MySQL
+# Innovatech Chile | ISY1101 EP2
+# ─────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Base de datos MySQL ──────────────────────────────────────────
+  db-despachos:
+    image: mysql:8.0
+    container_name: db-despachos
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass}
+      MYSQL_DATABASE: ${DB_NAME:-despachos_db}
+      MYSQL_USER: ${DB_USERNAME:-app_user}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-app_pass}
+    ports:
+      - "3307:3306"          # Puerto 3307 en host para no colisionar con MySQL local
+    volumes:
+      # Named volume: los datos persisten aunque se reinicie o borre el contenedor
+      - despachos-mysql-data:/var/lib/mysql
+    networks:
+      - despachos-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-rootpass}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── Backend Spring Boot ──────────────────────────────────────────
+  backend-despachos:
+    build:
+      context: ./Springboot-API-REST-DESPACHO
+      dockerfile: Dockerfile
+    container_name: backend-despachos
+    restart: unless-stopped
+    depends_on:
+      db-despachos:
+        condition: service_healthy   # Solo arranca cuando la DB esté lista
+    environment:
+      DB_ENDPOINT: db-despachos      # Nombre del servicio como hostname interno
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-despachos_db}
+      DB_USERNAME: ${DB_USERNAME:-app_user}
+      DB_PASSWORD: ${DB_PASSWORD:-app_pass}
+    ports:
+      - "8081:8081"
+    networks:
+      - despachos-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8081/swagger-ui.html || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+# ─────────────────────────────────────────────────────────────────
+# Named Volumes
+# Justificación: se usa named volume en lugar de bind mount porque:
+#  1. Docker gestiona la ubicación → portable entre SO
+#  2. Permisos seguros (no expone rutas del host en EC2)
+#  3. Persiste los datos de la BD aunque se destruya el contenedor
+# ─────────────────────────────────────────────────────────────────
+volumes:
+  despachos-mysql-data:
+    driver: local
+
+# ─────────────────────────────────────────────────────────────────
+# Redes internas
+# Frontend no está en esta red → solo Backend puede hablar con la DB
+# ─────────────────────────────────────────────────────────────────
+networks:
+  despachos-net:
+    driver: bridge
