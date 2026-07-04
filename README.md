@@ -1,196 +1,138 @@
 # Backend Despachos — API REST Spring Boot
 
-**Innovatech Chile | ISY1101 EP2**
+**Innovatech Chile | ISY1101 — EP3 (Orquestación y automatización en la nube)**
 
-API REST para la gestión de despachos, desarrollada con Spring Boot 3.4.4 y Java 17. Containerizada con Docker y desplegada automáticamente en AWS EC2 mediante GitHub Actions.
+API REST de gestión de **despachos** (Spring Boot 3.4.4 + Java 17). En EP3 corre
+como contenedor en **Amazon ECS (Fargate)**, con imagen en **Amazon ECR**,
+conectada a **RDS MySQL 8.0**, detrás de un **Application Load Balancer** y con
+**autoscaling** + **logs en CloudWatch**. Entrega continua con **GitHub Actions**.
 
 ---
 
-## Stack Tecnológico
+## Stack
 
 | Componente | Tecnología |
 |---|---|
-| Lenguaje | Java 17 |
-| Framework | Spring Boot 3.4.4 |
+| Lenguaje / Framework | Java 17 · Spring Boot 3.4.4 |
 | ORM | Spring Data JPA + Hibernate |
-| Base de datos | MySQL 8.0 |
-| Contenedorización | Docker (multi-stage build) |
+| Base de datos | **AWS RDS MySQL 8.0** (gestionada) |
+| Contenedor | Docker multi-stage (JDK build → JRE runtime, no-root) |
+| Registro de imágenes | **Amazon ECR** |
+| Orquestación | **Amazon ECS (Fargate)** |
+| Balanceo | **Application Load Balancer** (path `/api/v1/despachos*`) |
+| Escalado | **ECS Target Tracking** (CPU 50%, 1–4 tareas) |
+| Logs | **Amazon CloudWatch** (`/ecs/innovatech-backend-despachos`) |
+| Secrets | **SSM Parameter Store** (password de BD como SecureString) |
 | CI/CD | GitHub Actions |
-| Registro de imágenes | Docker Hub |
-| Despliegue | AWS EC2 |
-| Documentación API | Springdoc OpenAPI (Swagger UI) |
+| Docs API | Springdoc OpenAPI (Swagger) |
 
 ---
 
-## Estructura del Repositorio
+## Arquitectura (EP3)
 
 ```
-back-Despachos_SpringBoot/
-├── Springboot-API-REST-DESPACHO/     # Código fuente Spring Boot
-│   ├── src/
-│   │   └── main/
-│   │       ├── java/com/citt/
-│   │       │   ├── config/           # CORS, OpenAPI
-│   │       │   ├── controller/       # DespachoController
-│   │       │   ├── exceptions/       # Manejo de errores
-│   │       │   └── persistence/      # Entidades, repositorios, servicios
-│   │       └── resources/
-│   │           └── application.properties
-│   ├── Dockerfile                    # Multi-stage build
-│   └── pom.xml
-├── docker-compose.yml                # Stack completo (API + MySQL)
-├── .env.example                      # Variables de entorno de referencia
-├── .github/
-│   └── workflows/
-│       └── deploy.yml               # Pipeline CI/CD
-└── README.md
+Navegador → ALB (:80) ──/api/v1/despachos*──→ ECS Service (Fargate :8081)
+                                                   │  secrets vía SSM
+                                                   ▼
+                                              RDS MySQL  (schema despachos_db)
 ```
+El servicio no expone IP pública directa: el único punto de entrada es el ALB.
+La BD solo acepta conexiones desde el Security Group de las tareas ECS.
 
 ---
 
-## Variables de Entorno
+## Configuración (variables de entorno)
 
-Copiar `.env.example` a `.env` y completar con los valores reales. **Nunca commitear el archivo `.env`.**
+La app lee la conexión a BD desde variables; en ECS llegan así:
 
-| Variable | Descripción | Ejemplo |
+| Variable | Origen en ECS | Valor |
 |---|---|---|
-| `DB_ENDPOINT` | Host del servidor MySQL | `db-despachos` (Docker) / IP RDS (producción) |
-| `DB_PORT` | Puerto MySQL | `3306` |
-| `DB_NAME` | Nombre de la base de datos | `despachos_db` |
-| `DB_USERNAME` | Usuario de la base de datos | `app_user` |
-| `DB_PASSWORD` | Contraseña del usuario | `password_seguro` |
-| `MYSQL_ROOT_PASSWORD` | Contraseña root MySQL (solo Docker) | `root_password` |
+| `DB_ENDPOINT` | **SSM** `/innovatech/db_endpoint` | endpoint del RDS |
+| `DB_PASSWORD` | **SSM** `/innovatech/db_password` (SecureString) | contraseña maestra |
+| `DB_PORT` | task def (environment) | `3306` |
+| `DB_NAME` | task def (environment) | `despachos_db` |
+| `DB_USERNAME` | task def (environment) | `admin` |
+
+El JDBC trae `createDatabaseIfNotExist=true`, así que el schema `despachos_db`
+se crea solo la primera vez. Ver `.env.example` para ejecución local.
 
 ---
 
-## Ejecución Local con Docker Compose
-
-### Requisitos
-- Docker Desktop instalado y corriendo
-- Git
-
-### Pasos
+## Ejecución local con Docker Compose
 
 ```bash
-# 1. Clonar el repositorio
-git clone https://github.com/TU_USUARIO/back-despachos.git
-cd back-despachos
-
-# 2. Crear archivo de variables de entorno
-cp .env.example .env
-# Editar .env con tus valores
-
-# 3. Levantar el stack completo (MySQL + API)
-docker compose up -d
-
-# 4. Verificar que los contenedores están corriendo
-docker compose ps
-
-# 5. Ver logs
+cp .env.example .env          # editar credenciales locales
+docker compose up -d          # levanta API + MySQL local
 docker compose logs -f backend-despachos
 ```
-
-### Acceder a la API
-
-- **Swagger UI:** http://localhost:8081/swagger-ui.html
-- **API Base:** http://localhost:8081/api/despachos
-
-### Detener el stack
-
-```bash
-docker compose down          # Detiene contenedores (datos persisten en el volumen)
-docker compose down -v       # Detiene contenedores Y elimina volúmenes (borra la BD)
-```
+- Swagger UI: http://localhost:8081/swagger-ui.html
+- Health (ALB usa este): http://localhost:8081/v3/api-docs
 
 ---
 
-## Pipeline CI/CD — GitHub Actions
+## Pipeline CI/CD (GitHub Actions → ECR → ECS)
 
-El pipeline se activa automáticamente con cada `push` a la rama `deploy`.
-
-### Flujo
+Se activa con `push` a la rama **`deploy`** (`.github/workflows/deploy.yml`):
 
 ```
-push → rama deploy
-    └── JOB 1: Build & Push
-        ├── Checkout del código
-        ├── Login en Docker Hub
-        ├── Build imagen Docker (multi-stage)
-        └── Push a Docker Hub (tags: SHA + latest)
-            └── JOB 2: Deploy en EC2
-                ├── SSH a instancia EC2 Backend
-                ├── Pull de la nueva imagen
-                ├── Stop/rm del contenedor anterior
-                ├── docker run con variables de entorno
-                └── Verificación de estado
+checkout
+  → credenciales AWS (Learner Lab, con AWS_SESSION_TOKEN)
+  → resolver ACCOUNT_ID/REGION en ecs-task-def.json
+  → login Amazon ECR
+  → docker build (contexto ./Springboot-API-REST-DESPACHO) + push (SHA + latest)
+  → render task definition con la nueva imagen
+  → deploy a ECS (rolling update, espera estabilidad)
 ```
 
-### Secrets requeridos en GitHub
+### Secrets requeridos
 
-Configurar en: `Settings → Secrets and variables → Actions`
-
-| Secret | Descripción |
+| Secret | Para qué |
 |---|---|
-| `DOCKERHUB_USERNAME` | Usuario de Docker Hub |
-| `DOCKERHUB_TOKEN` | Access token de Docker Hub |
-| `EC2_BACKEND_HOST` | IP pública de la EC2 Backend |
-| `EC2_USERNAME` | Usuario SSH de EC2 (`ec2-user` o `ubuntu`) |
-| `EC2_SSH_PRIVATE_KEY` | Contenido completo del archivo `.pem` |
-| `DB_ENDPOINT` | IP/hostname de la base de datos en EC2 |
-| `DB_PORT` | Puerto MySQL (`3306`) |
-| `DB_NAME` | Nombre de la base de datos |
-| `DB_USERNAME` | Usuario de la base de datos |
-| `DB_PASSWORD` | Contraseña de la base de datos |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | credenciales temporales del Learner Lab |
 
-### Hacer un deploy
+Se refrescan cada sesión con `innovatech-ep3-infra/update_secrets.py`.
 
-```bash
-# Desde la rama principal, hacer merge a deploy
-git checkout deploy
-git merge main
-git push origin deploy
-# El pipeline se activa automáticamente
-```
+### task definition (`ecs-task-def.json`)
+
+Fargate 512 CPU / 1024 MB · `LabRole` como execution/task role · logs a
+CloudWatch · `DB_ENDPOINT` y `DB_PASSWORD` inyectados desde SSM (bloque
+`secrets`). `ACCOUNT_ID`/`REGION` son placeholders que el pipeline resuelve.
 
 ---
 
-## Dockerfile — Decisiones Técnicas
+## Dockerfile — decisiones técnicas
 
-Se usa **multi-stage build** por las siguientes razones:
-
-1. **Imagen de producción más pequeña:** el JDK (builder) pesa ~400MB, el JRE (runtime) ~170MB. La imagen final no incluye herramientas de compilación.
-2. **Seguridad:** sin Maven ni código fuente en la imagen de producción.
-3. **Usuario no-root:** el proceso corre como `appuser` en lugar de `root`, siguiendo el principio de mínimo privilegio.
-4. **Limpieza de capas:** las dependencias se cachean en una capa separada al código fuente.
-
----
-
-## Persistencia de Datos
-
-Se usa **named volume** (`despachos-mysql-data`) en lugar de bind mount porque:
-
-- Docker gestiona la ubicación del volumen → portable entre el equipo local y EC2
-- No expone rutas del sistema de archivos del host
-- Los datos de MySQL persisten aunque se destruya y recree el contenedor
-- Compatible con AWS EBS si se necesita migrar a almacenamiento gestionado
+1. **Multi-stage**: builder con JDK (~400 MB) → runtime con JRE (~170 MB), sin
+   Maven ni código fuente en la imagen final.
+2. **Usuario no-root** (`appuser`): principio de mínimo privilegio.
+3. **Caché de capas**: dependencias Maven se cachean aparte del código.
+4. **Health check** en `/v3/api-docs` (responde 200 sin redirección, apto para
+   el health check del Target Group del ALB).
 
 ---
 
-## Endpoints Principales
+## Endpoints principales
 
 | Método | Endpoint | Descripción |
 |---|---|---|
-| GET | `/api/despachos` | Listar todos los despachos |
-| GET | `/api/despachos/{id}` | Obtener despacho por ID |
-| POST | `/api/despachos` | Crear nuevo despacho |
-| PUT | `/api/despachos/{id}` | Actualizar despacho |
-| DELETE | `/api/despachos/{id}` | Eliminar despacho |
+| GET | `/api/v1/despachos` | Listar despachos |
+| GET | `/api/v1/despachos/{id}` | Obtener por ID |
+| POST | `/api/v1/despachos` | Crear |
+| PUT | `/api/v1/despachos/{id}` | Actualizar / cerrar |
+| DELETE | `/api/v1/despachos/{id}` | Eliminar |
 
-Documentación completa disponible en Swagger UI al ejecutar la aplicación.
+A través del ALB: `http://<ALB-DNS>/api/v1/despachos`.
+
+---
+
+## Despliegue completo en AWS
+
+Montaje paso a paso (ECR, RDS, ALB, cluster, servicios, autoscaling) en
+[`innovatech-ep3-infra/GUIA-AWS-EP3.md`](../innovatech-ep3-infra/GUIA-AWS-EP3.md).
 
 ---
 
 ## Autores
 
-- Tomás [Apellido] — ISY1101 | DuocUC 2025
-- Matías Ampuero — ISY1101 | DuocUC 2025
+- Tomás Escobar — ISY1101 | DuocUC 2026
+- Matías Ampuero — ISY1101 | DuocUC 2026

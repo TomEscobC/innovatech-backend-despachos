@@ -1,113 +1,82 @@
 # ─────────────────────────────────────────────────────────────────
 # .github/workflows/deploy.yml
-# Pipeline CI/CD — Backend Despachos
+# Pipeline CI/CD — Backend Despachos  (EP3: orquestación en ECS)
 # Trigger: push en la rama "deploy"
-# Flujo: Build → Push a Docker Hub → Deploy en EC2
+# Flujo: Build → Push a Amazon ECR → Deploy en ECS Fargate
 # ─────────────────────────────────────────────────────────────────
 
-name: CI/CD Backend Despachos
+name: CI/CD Backend Despachos - ECS Fargate
 
 on:
   push:
     branches:
-      - deploy       # Solo se activa con push a la rama "deploy"
+      - deploy
+  workflow_dispatch:
 
 env:
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/backend-despachos
-  IMAGE_TAG: ${{ github.sha }}
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: innovatech-backend-despachos
+  ECS_CLUSTER: innovatech-cluster
+  ECS_SERVICE: backend-despachos-service
+  ECS_TASK_DEF: ecs-task-def.json
+  CONTAINER_NAME: backend-despachos
+  BUILD_CONTEXT: ./Springboot-API-REST-DESPACHO
 
 jobs:
-  # ──────────────────────────────────────────────────────────────
-  # JOB 1: Build & Push — construye la imagen y la sube a Docker Hub
-  # ──────────────────────────────────────────────────────────────
-  build-and-push:
-    name: Build y Push Docker Image
+  deploy:
+    name: Build, Push a ECR y Deploy a ECS
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout del código fuente
       - name: Checkout código
         uses: actions/checkout@v4
 
-      # 2. Configurar Java 17 para el build de Maven (opcional si el Dockerfile es autosuficiente)
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      # Credenciales temporales de AWS Academy Learner Lab (con session token)
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          java-version: "17"
-          distribution: "temurin"
-          cache: maven
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      # 3. Login en Docker Hub usando secrets de GitHub
-      - name: Login en Docker Hub
-        uses: docker/login-action@v3
+      - name: Resolver Account ID en task definition
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          sed -i "s|ACCOUNT_ID|$ACCOUNT_ID|g; s|REGION|${{ env.AWS_REGION }}|g" ${{ env.ECS_TASK_DEF }}
+
+      - name: Login en Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # El JAR se compila DENTRO del Dockerfile (multi-stage), el contexto
+      # es la subcarpeta del proyecto Spring Boot
+      - name: Build, tag y push de imagen a ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            ${{ env.BUILD_CONTEXT }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Renderizar task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          task-definition: ${{ env.ECS_TASK_DEF }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
 
-      # 4. Configurar Docker Buildx (soporte multi-plataforma y caché)
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # 5. Build y push de la imagen con multi-tag (SHA + latest)
-      - name: Build y Push imagen Docker
-        uses: docker/build-push-action@v5
+      - name: Deploy a Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
-          context: ./Springboot-API-REST-DESPACHO
-          file: ./Springboot-API-REST-DESPACHO/Dockerfile
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            ${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ──────────────────────────────────────────────────────────────
-  # JOB 2: Deploy — conecta a EC2 y actualiza el contenedor
-  # ──────────────────────────────────────────────────────────────
-  deploy-to-ec2:
-    name: Deploy en EC2
-    runs-on: ubuntu-latest
-    needs: build-and-push   # Solo corre si el build fue exitoso
-
-    steps:
-      # 6. Despliegue vía SSH a la instancia EC2 del Backend
-      - name: Deploy en EC2 via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_BACKEND_HOST }}       # IP pública o DNS de la instancia EC2
-          username: ${{ secrets.EC2_USERNAME }}        # Usuario SSH (ej: ec2-user, ubuntu)
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}      # Clave privada .pem del EC2
-          port: 22
-          script: |
-            # Hacer login en Docker Hub desde EC2
-            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-
-            # Descargar la nueva imagen
-            docker pull ${{ env.IMAGE_NAME }}:latest
-
-            # Detener y eliminar el contenedor anterior (si existe)
-            docker stop backend-despachos 2>/dev/null || true
-            docker rm backend-despachos 2>/dev/null || true
-
-            # Asegurar que la red interna existe
-            docker network create backend-net 2>/dev/null || true
-
-            # Levantar el nuevo contenedor con variables de entorno desde EC2 Secrets
-            docker run -d \
-              --name backend-despachos \
-              --network backend-net \
-              --restart unless-stopped \
-              -p 8081:8081 \
-              -e DB_ENDPOINT="db-despachos" \
-              -e DB_PORT="3306" \
-              -e DB_NAME="${{ secrets.DB_NAME }}" \
-              -e DB_USERNAME="${{ secrets.DB_USERNAME }}" \
-              -e DB_PASSWORD="${{ secrets.DB_PASSWORD }}" \
-              ${{ env.IMAGE_NAME }}:latest
-
-            # Verificar que el contenedor quedó corriendo
-            sleep 10
-            docker ps | grep backend-despachos
-
-            # Limpiar imágenes antiguas para liberar espacio en disco
-            docker image prune -f
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
